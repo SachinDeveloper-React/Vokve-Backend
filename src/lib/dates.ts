@@ -1,0 +1,116 @@
+/**
+ * Local-day helpers. The product's unit of time is the user's local calendar
+ * day (RULES A3, D2): computed once from a timestamp and an IANA zone, stored,
+ * never recomputed.
+ */
+export type IsoDate = string;
+
+export function localDayOf(at: Date, timeZone: string): IsoDate {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(at);
+  const get = (type: string) => parts.find(p => p.type === type)?.value ?? '00';
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+export function addDays(iso: IsoDate, days: number): IsoDate {
+  const [y, m, d] = iso.split('-').map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d + days));
+  return date.toISOString().slice(0, 10);
+}
+
+export function monthKeyOf(iso: IsoDate): string {
+  return iso.slice(0, 7);
+}
+
+export function isValidTimeZone(tz: string): boolean {
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** How far `timeZone`'s wall clock is ahead of UTC at `at`, in milliseconds. */
+function zoneOffsetMs(at: Date, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(at);
+  const get = (type: string) => Number(parts.find(p => p.type === type)?.value ?? 0);
+  const wall = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'), get('second'));
+  return wall - Math.floor(at.getTime() / 1000) * 1000;
+}
+
+/** The instant a local day begins in `timeZone` — 00:00 on its wall clock. */
+export function localMidnightUtc(day: IsoDate, timeZone: string): Date {
+  const [y, m, d] = day.split('-').map(Number);
+  const wall = Date.UTC(y, m - 1, d);
+  // Twice: the first guess can sit across a DST change from the answer.
+  const first = wall - zoneOffsetMs(new Date(wall), timeZone);
+  return new Date(wall - zoneOffsetMs(new Date(first), timeZone));
+}
+
+/** The hour on `timeZone`'s wall clock at `at`, 0–23. */
+export function localHourOf(at: Date, timeZone: string): number {
+  const hour = new Intl.DateTimeFormat('en-GB', { timeZone, hour: '2-digit', hourCycle: 'h23' }).format(at);
+  return Number(hour) % 24;
+}
+
+/**
+ * The wall clock at `at` in `timeZone`, as `HH:mm`.
+ *
+ * The form a reminder is stored in (RULES Y5), so the sweep can compare a
+ * plan's times against the clock the member reads without any date
+ * arithmetic — the only thing that matters to "is 07:00 now?" is the two
+ * numbers on the face.
+ */
+export function localTimeOf(at: Date, timeZone: string): string {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).format(at);
+}
+
+/** The weekday on `timeZone`'s wall clock at `at`, 0 = Monday (RULES Y5). */
+export function localWeekdayOf(at: Date, timeZone: string): number {
+  return weekdayOf(localDayOf(at, timeZone));
+}
+
+/** 0 = Monday … 6 = Sunday (RULES Y5), for a day already in local form. */
+export function weekdayOf(day: IsoDate): number {
+  return (new Date(`${day}T00:00:00Z`).getUTCDay() + 6) % 7;
+}
+
+const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** "21 Sep 2026" — a day, written out, for wording the server owns. */
+export function formatDay(day: IsoDate): string {
+  const [y, m, d] = day.split('-').map(Number);
+  return `${d} ${MONTHS_SHORT[m - 1]} ${y}`;
+}
+
+/**
+ * "15 – 21 Sep 2026", collapsing whatever the two ends share — "28 Sep – 4
+ * Oct 2026" across a month, both years in full across a year.
+ */
+export function formatDayRange(from: IsoDate, to: IsoDate): string {
+  if (from === to) return formatDay(from);
+  const [fy, fm, fd] = from.split('-').map(Number);
+  const [ty, tm, td] = to.split('-').map(Number);
+  if (fy !== ty) return `${formatDay(from)} – ${formatDay(to)}`;
+  if (fm !== tm) return `${fd} ${MONTHS_SHORT[fm - 1]} – ${td} ${MONTHS_SHORT[tm - 1]} ${ty}`;
+  return `${fd} – ${td} ${MONTHS_SHORT[tm - 1]} ${ty}`;
+}

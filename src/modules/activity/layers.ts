@@ -1,0 +1,602 @@
+import type { AppConfig } from '../../config/defaults.js';
+import type { FlagLayer } from '../integrity/models.js';
+import type { DeviceDayEvidence, SourceEvidence } from './snapshot.js';
+
+/**
+ * The fraud layers (BACKEND §7.5, RULES A14–A20), as pure functions of what
+ * a day's snapshots proved. No single check catches fake steps; each layer
+ * scores 0–100, a layer with nothing to judge stays out of the mean, and a
+ * hard flag makes the day unverified whatever the score.
+ *
+ * Shadow mode (RULES T9, D-05) is not decided here: these always say what
+ * they found. Whether a finding costs anybody anything is the caller's call.
+ */
+
+export type Severity = 'hard' | 'soft' | 'info';
+export type LayerName = 'L0' | 'L1' | 'L2' | 'L3' | 'L4' | 'L5' | 'L6';
+
+export interface DayFlag {
+  layer: FlagLayer;
+  kind: string;
+  severity: Severity;
+  deviceId: string | null;
+  details: Record<string, unknown>;
+}
+
+/** What the server holds about one device that sent the day. */
+export interface DeviceInput {
+  deviceId: string;
+  evidence: DeviceDayEvidence;
+  key: {
+    attested: boolean;
+    failure: string | null;
+    verifiedBootState: string | null;
+    deviceLocked: boolean | null;
+  } | null;
+  play: { verdict: string; reasons: string[] } | null;
+  /**
+   * Whether this server asks for Play Integrity at all (a Cloud project is
+   * configured). Only then is a day that carried no verdict the phone's
+   * silence rather than the operator's choice — so only then does it cost
+   * anything (RULES A24).
+   */
+  integrityExpected?: boolean;
+  /** Other accounts this install or vendor id is registered to (A18). */
+  sharedAccounts: number;
+  /** Other accounts holding this device's attestation key. */
+  keySharedAccounts: number;
+  firstSeenAt: Date | null;
+}
+
+/** The user's earlier days, newest first — what the behavioural checks compare with (A17). */
+export interface HistoryDay {
+  localDay: string;
+  pedometerSteps: number | null;
+}
+
+/**
+ * What became of one Health Connect source on one device's day:
+ * - `used` — it answered for the day: allowed, and above the phone's clean count;
+ * - `lower` — allowed and believable, and the phone (or another source) counted more;
+ * - `not_counted` — allowed, but more than ⚙ `pedometerRatio.hard` times what the phone saw (A15);
+ * - `unverified` — an app not on the allowlist: shown, never paid (A14);
+ * - `blocked` — on the denylist;
+ * - `not_computed` — the tracker could not split typed-in from counted steps.
+ */
+export type SourceStatus = 'used' | 'lower' | 'not_counted' | 'unverified' | 'blocked' | 'not_computed';
+
+export interface SourceDecision {
+  packageName: string;
+  appName: string;
+  kind: string;
+  isWearable: boolean;
+  isPlatform: boolean;
+  /** Everything the app wrote for the day. */
+  steps: number;
+  /** Typed in by hand; null when not computed. */
+  manualSteps: number | null;
+  /** Recording method not stated; null when not computed. */
+  unknownMethodSteps: number | null;
+  /** What could count: `steps` less the above, as config has it. */
+  countable: number | null;
+  /** `countable` ÷ the phone's own count; null when either is missing. */
+  ratioToPhone: number | null;
+  standing: 'allowed' | 'denied' | 'unknown';
+  status: SourceStatus;
+}
+
+export interface DeviceScore {
+  deviceId: string;
+  /** What the day shows: what the phone showed its user, or the server's count when higher. */
+  displaySteps: number;
+  /** The phone's own count, and what was taken off it before it competed. */
+  phone: { counted: number; recovered: number; flagged: number; clean: number };
+  /** The phone's own count, less what it recovered in one go or flagged. */
+  phoneClean: number;
+  /** Every Health Connect source the device reported, and what became of it. */
+  sources: SourceDecision[];
+  /** The best count this device's evidence supports, before the day is judged. */
+  candidate: number;
+  source: 'device' | 'health_connect';
+  winner: SourceEvidence | null;
+  layers: Record<LayerName, number | null>;
+  plausibility: number;
+  flags: DayFlag[];
+  hard: string[];
+  verified: boolean;
+  verifiedSteps: number;
+}
+
+type ActivityConfig = AppConfig['activity'];
+
+/** `com.android.healthconnect.phone.*` matches by prefix; anything else exactly. */
+export function matchesPackage(packageName: string, patterns: readonly string[]): boolean {
+  return patterns.some(pattern =>
+    pattern.endsWith('*') ? packageName.startsWith(pattern.slice(0, -1)) : packageName === pattern,
+  );
+}
+
+/**
+ * A source's steps that may count: typed-in steps never do (A1), and steps
+ * whose recording method is unstated only when config says so (§7.4). Null
+ * when the split was not computed — such a total cannot be judged.
+ */
+export function countableSteps(source: SourceEvidence, provenance: ActivityConfig['provenance']): number | null {
+  if (source.manualSteps < 0) return null;
+  let steps = source.steps - source.manualSteps;
+  if (!provenance.countUnknownMethod) {
+    if (source.unknownMethodSteps < 0) return null;
+    steps -= source.unknownMethodSteps;
+  }
+  return Math.max(0, steps);
+}
+
+function sourceStanding(source: SourceEvidence, provenance: ActivityConfig['provenance']): 'denied' | 'allowed' | 'unknown' {
+  if (matchesPackage(source.packageName, provenance.deny)) return 'denied';
+  if (matchesPackage(source.packageName, provenance.allow)) return 'allowed';
+  if (provenance.trustTrackerCatalog && source.trustedWearable) return 'allowed';
+  return 'unknown';
+}
+
+export function scoreDevice(
+  input: DeviceInput,
+  history: HistoryDay[],
+  now: Date,
+  config: AppConfig,
+): DeviceScore {
+  const ev = input.evidence;
+  const t = config.activity.thresholds;
+  const flags: DayFlag[] = [];
+  const flag = (layer: FlagLayer, kind: string, severity: Severity, details: Record<string, unknown> = {}) =>
+    flags.push({ layer, kind, severity, deviceId: input.deviceId, details });
+
+  const deviceSteps = ev.deviceSteps;
+  const phoneClean = Math.max(0, deviceSteps - ev.recoveredSteps - ev.suspectSteps);
+
+  // ─── L0 · device integrity ──────────────────────────────────────────────
+  let l0 = 100;
+  const key = input.key;
+  if (!key) {
+    l0 = 0;
+    flag('L0', 'no_key', 'hard');
+  } else if (!key.attested) {
+    // A broken or misdirected chain is a forgery; a chain that simply proves
+    // nothing is a phone that cannot attest, and costs score only.
+    if (key.failure === 'chain_invalid' || key.failure === 'revoked' || key.failure === 'wrong_package' || key.failure === 'wrong_signer') {
+      l0 = 0;
+      flag('L0', `attestation_${key.failure}`, 'hard');
+    } else {
+      l0 = Math.min(l0, 40);
+      flag('L0', 'key_not_attested', 'soft', { failure: key.failure });
+    }
+  } else if (key.verifiedBootState !== 'verified' || key.deviceLocked === false) {
+    // An unlocked bootloader or an OS its maker did not sign: the phone can
+    // be made to say anything.
+    l0 = 10;
+    flag('L0', 'boot_not_verified', 'hard', { verifiedBootState: key.verifiedBootState, deviceLocked: key.deviceLocked });
+  }
+
+  const play = input.play;
+  const integrity = config.integrity;
+  if (!key?.attested && integrity.requireAttested) {
+    // Turned on for the rollout (A12): until then the soft penalty above is
+    // what a key that cannot be attested costs.
+    l0 = 0;
+    flag('L0', 'attestation_required', 'hard', { failure: key?.failure ?? null });
+  }
+  if (!play && input.integrityExpected) {
+    // The server asks for a verdict and this day carried none: an old build,
+    // a phone without Play services — or a build that would rather not say.
+    l0 = Math.min(l0, 70);
+    flag('L0', 'play_integrity_missing', integrity.requireVerdict ? 'hard' : 'soft');
+    if (integrity.requireVerdict) l0 = 0;
+  }
+  if (play) {
+    if (play.verdict === 'fail') {
+      const hardReasons = play.reasons.filter(reason => reason !== 'stale_token' && reason !== 'unlicensed');
+      if (hardReasons.length > 0) {
+        l0 = Math.min(l0, 0);
+        flag('L0', 'play_integrity_failed', 'hard', { reasons: play.reasons });
+      } else {
+        l0 = Math.min(l0, 70);
+        flag('L0', 'play_integrity_weak', 'soft', { reasons: play.reasons });
+      }
+    } else if (play.verdict === 'unavailable') {
+      l0 = Math.min(l0, 70);
+      flag('L0', 'play_integrity_unavailable', integrity.requireVerdict ? 'hard' : 'soft', { reasons: play.reasons });
+      if (integrity.requireVerdict) l0 = 0;
+    }
+  }
+
+  if (ev.hints.emulator) {
+    l0 = 0;
+    flag('L0', 'emulator', 'hard');
+  }
+  if (ev.hints.suBinary || ev.hints.testKeysBuild) {
+    l0 = Math.min(l0, 30);
+    flag('L0', 'rooted', 'soft', { suBinary: ev.hints.suBinary, testKeysBuild: ev.hints.testKeysBuild });
+  }
+  if (ev.hints.appDebuggable) {
+    l0 = Math.min(l0, 50);
+    flag('L0', 'debug_build', 'soft');
+  }
+  if (ev.hints.adbEnabled || ev.hints.developerOptions) {
+    flag('L0', 'developer_options', 'info', { adb: ev.hints.adbEnabled });
+  }
+
+  // ─── L1 · provenance ────────────────────────────────────────────────────
+  let l1: number | null = null;
+  const provenance = config.activity.provenance;
+  const external: { source: SourceEvidence; steps: number }[] = [];
+  const decisions = new Map<SourceEvidence, SourceDecision>();
+  const decide = (source: SourceEvidence, standing: SourceDecision['standing'], countable: number | null, status: SourceStatus) =>
+    decisions.set(source, {
+      packageName: source.packageName,
+      appName: source.appName,
+      kind: source.kind,
+      isWearable: source.isWearable,
+      isPlatform: source.isPlatform,
+      steps: source.steps,
+      manualSteps: source.manualSteps >= 0 ? source.manualSteps : null,
+      unknownMethodSteps: source.unknownMethodSteps >= 0 ? source.unknownMethodSteps : null,
+      countable,
+      ratioToPhone: countable !== null && deviceSteps > 0 ? round2(countable / deviceSteps) : null,
+      standing,
+      status,
+    });
+  if (ev.sources.length > 0) {
+    l1 = 100;
+    for (const source of ev.sources) {
+      const standing = sourceStanding(source, provenance);
+      if (standing === 'denied') {
+        l1 = Math.min(l1, 40);
+        flag('L1', 'denylisted_source', 'soft', { packageName: source.packageName, steps: source.steps });
+        decide(source, standing, null, 'blocked');
+        continue;
+      }
+      if (source.manualSteps > 0) {
+        l1 = Math.min(l1, 80);
+        flag('L1', 'manual_entries', 'soft', { packageName: source.packageName, manualSteps: source.manualSteps });
+      }
+      const steps = countableSteps(source, provenance);
+      if (steps === null) {
+        decide(source, standing, null, 'not_computed');
+        continue;
+      }
+      if (standing === 'allowed') {
+        external.push({ source, steps });
+        decide(source, standing, steps, 'lower');
+        continue;
+      }
+      decide(source, standing, steps, 'unverified');
+      if (steps > phoneClean) {
+        // Shown to the user, never paid, never punished (A14).
+        l1 = Math.min(l1, 90);
+        flag('L1', 'unverified_source', 'info', { packageName: source.packageName, steps });
+      }
+    }
+  }
+
+  // ─── L3 · cross-source ──────────────────────────────────────────────────
+  let l3: number | null = null;
+  const ratio = config.activity.thresholds.pedometerRatio;
+  let best: { source: SourceEvidence; steps: number } | null = null;
+  for (const candidate of external) {
+    if (candidate.steps <= 0) continue;
+    if (deviceSteps > 0) {
+      const r = candidate.steps / deviceSteps;
+      if (r > ratio.hard) {
+        // More than double what the phone saw: the surplus cannot be
+        // corroborated, so the source does not count and the day falls back
+        // on the phone's own count (A15).
+        l3 = Math.min(l3 ?? 100, 30);
+        flag('L3', 'pedometer_mismatch', 'soft', { packageName: candidate.source.packageName, ratio: round2(r), hard: true });
+        decisions.get(candidate.source)!.status = 'not_counted';
+        continue;
+      }
+      if (r < ratio.min || r > ratio.max) {
+        l3 = Math.min(l3 ?? 100, 60);
+        flag('L3', 'pedometer_mismatch', 'soft', { packageName: candidate.source.packageName, ratio: round2(r) });
+      } else {
+        l3 = l3 ?? 100;
+      }
+    }
+    if (!best || candidate.steps > best.steps) best = candidate;
+  }
+
+  const externalWins = best !== null && best.steps > phoneClean;
+  const candidate = externalWins ? best!.steps : phoneClean;
+  const winner = externalWins ? best!.source : null;
+  if (winner) decisions.get(winner)!.status = 'used';
+
+  // ─── L2 · statistical plausibility ──────────────────────────────────────
+  let l2 = 100;
+  if (deviceSteps > 0) {
+    const suspectShare = ev.suspectSteps / deviceSteps;
+    l2 = Math.round(100 * (1 - Math.min(1, suspectShare)));
+    if (suspectShare >= t.suspectShareHard) {
+      flag('L2', 'suspect_motion', 'hard', { suspectSteps: ev.suspectSteps, share: round2(suspectShare), strong: ev.checks.strong });
+    } else if (ev.suspectSteps > 0) {
+      flag('L2', 'suspect_motion', 'soft', { suspectSteps: ev.suspectSteps, share: round2(suspectShare), strong: ev.checks.strong });
+    }
+    if (ev.minutes.status === 'enabled') {
+      const untimedShare = ev.minutes.untimedSteps / deviceSteps;
+      if (untimedShare > t.untimedShare) {
+        l2 = Math.max(0, l2 - 20);
+        flag('L2', 'untimed_steps', 'soft', { share: round2(untimedShare) });
+      }
+    }
+  }
+  // A6, as the server can check it: one minute nobody could have walked.
+  // The phone sends what it counted and the minutes it counted them in, so
+  // an impossible cadence is arithmetic, not a judgement call — which is why
+  // this is hard from the first day rather than waiting on shadow data.
+  if (ev.minutes.status === 'enabled' && ev.minutes.peakMinuteSteps > t.maxStepsPerMinute) {
+    l2 = 0;
+    flag('L2', 'cadence_impossible', 'hard', { peakMinuteSteps: ev.minutes.peakMinuteSteps, max: t.maxStepsPerMinute });
+  }
+  // The simplest tamper there is: leave the minutes alone and raise the
+  // total. Steps the counter handed over in a backlog, and steps its own
+  // checks flagged, are already off `phoneClean`, so what is left here is a
+  // count with no minute of the day behind it.
+  if (ev.minutes.status === 'enabled' && phoneClean > 0) {
+    const placed = ev.minutes.timedSteps + ev.minutes.untimedSteps;
+    const unaccounted = Math.max(0, phoneClean - placed);
+    const share = unaccounted / phoneClean;
+    const hardAt = t.unaccountedShareHard;
+    if (share > t.unaccountedShare) {
+      const hard = hardAt !== null && share > hardAt;
+      l2 = hard ? 0 : Math.min(l2, 30);
+      flag('L2', 'steps_unaccounted', hard ? 'hard' : 'soft', {
+        phoneClean, placed, unaccounted, share: round2(share),
+      });
+    }
+  }
+  const dayTotal = Math.max(deviceSteps, candidate);
+  if (dayTotal > t.maxDailySteps) {
+    l2 = Math.min(l2, 60);
+    flag('L2', 'daily_volume', 'soft', { steps: dayTotal });
+  }
+  if (dayTotal > t.impossibleDailySteps) {
+    // Past what a 24-hour race walker covers: not a day to be doubted, a day
+    // to be refused.
+    l2 = 0;
+    flag('L2', 'daily_volume_impossible', 'hard', { steps: dayTotal, max: t.impossibleDailySteps });
+  }
+  if (!ev.checks.enabled) {
+    l2 = Math.min(l2, 50);
+    flag('L2', 'checks_disabled', 'soft');
+  } else if (ev.minutes.status !== 'enabled') {
+    l2 = Math.min(l2, 60);
+    flag('L2', 'no_minutes', 'soft', { status: ev.minutes.status });
+  }
+  if (ev.checks.clockJumps > 0) {
+    l2 = Math.min(l2, 70);
+    flag('L2', 'clock_changed', 'soft', { jumps: ev.checks.clockJumps });
+  }
+  if (ev.signedAt > now.getTime() + config.activity.futureSkewMinutes * 60_000) {
+    flag('L2', 'clock_ahead', 'hard', { signedAt: ev.signedAt, serverAt: now.getTime() });
+  }
+  if (ev.checks.resets > 0) flag('L2', 'counter_reset', 'info', { resets: ev.checks.resets });
+  if (winner && winner.distanceSource === 'health_connect' && winner.distance > 0 && best!.steps > 0) {
+    const stride = winner.distance / best!.steps;
+    if (stride < t.strideMeters.min || stride > t.strideMeters.max) {
+      l2 = Math.max(0, l2 - 20);
+      flag('L2', 'stride_incoherent', 'soft', { packageName: winner.packageName, stride: round2(stride) });
+    }
+  }
+
+  // ─── L4 · motion signature ──────────────────────────────────────────────
+  let l4: number | null = null;
+  const motionAsked = config.activity.tracker.motionSampling.enabled;
+  if (ev.motion.status !== 'enabled') {
+    // Opting out lowers trust, never blocks (D-23) — but it has to *lower*
+    // something. A layer left out of the mean scored better than an honest
+    // phone with a few shaken windows in it, which made switching the
+    // sampling off the cheapest thing a tampered build could do.
+    if (motionAsked) {
+      l4 = t.motion.absentScore;
+      flag('L4', 'motion_absent', 'soft', { status: ev.motion.status });
+    } else {
+      flag('L4', 'motion_disabled', 'info', { status: ev.motion.status });
+    }
+  } else if (ev.motion.stepWindows > 0) {
+    const nonWalk = ev.motion.shake + ev.motion.still;
+    const share = nonWalk / ev.motion.stepWindows;
+    l4 = Math.round(100 * (1 - share));
+    if (share >= t.motion.nonWalkHardShare) {
+      flag('L4', 'motion_non_walk', 'hard', { share: round2(share), windows: ev.motion.stepWindows, shake: ev.motion.shake, still: ev.motion.still });
+    } else if (ev.motion.shake > 0) {
+      flag('L4', 'shake_windows', 'soft', { shake: ev.motion.shake, windows: ev.motion.stepWindows });
+    }
+  }
+
+  // ─── L5 · temporal and behavioural ──────────────────────────────────────
+  let l5 = 100;
+  const behaviour = (kind: string, details: Record<string, unknown>) => {
+    l5 = Math.max(0, l5 - 25);
+    flag('L5', kind, 'soft', details);
+  };
+  if (deviceSteps > 0 && ev.minutes.status === 'enabled') {
+    const nightShare = ev.minutes.nightSteps / deviceSteps;
+    if (nightShare > t.nightShare) behaviour('night_steps', { share: round2(nightShare) });
+  }
+  if (
+    input.firstSeenAt &&
+    ev.signedAt - input.firstSeenAt.getTime() < 24 * 3_600_000 &&
+    dayTotal >= t.newInstallSteps
+  ) {
+    behaviour('new_install_volume', { steps: dayTotal });
+  }
+  const recent = [deviceSteps, ...history.slice(0, 6).map(day => day.pedometerSteps ?? 0)];
+  const round = recent.filter(steps => steps >= 1000 && steps % 1000 === 0).length;
+  if (round >= t.roundTotalDays) behaviour('round_totals', { days: round });
+  const yesterday = history[0]?.pedometerSteps ?? null;
+  if (deviceSteps > 0 && yesterday === deviceSteps) behaviour('identical_totals', { steps: deviceSteps });
+
+  // ─── L6 · graph ─────────────────────────────────────────────────────────
+  let l6 = 100;
+  if (input.keySharedAccounts > 0) {
+    l6 = 0;
+    flag('L6', 'key_shared', 'hard', { accounts: input.keySharedAccounts + 1 });
+  }
+  if (input.sharedAccounts + 1 >= config.devices.flagAtAccountsPerDevice) {
+    l6 = Math.min(l6, 50);
+    flag('L6', 'device_shared', 'soft', { accounts: input.sharedAccounts + 1 });
+  }
+
+  // ─── Nothing behind the count ───────────────────────────────────────────
+  // A day with no minutes, no motion windows and no allowed Health Connect
+  // app behind it is a number and nothing else. Small days still stand — a
+  // phone that could not sample a short walk is ordinary — but a day that
+  // claims a marathon with no evidence at all is not verified (A25).
+  const dayClaim = Math.max(deviceSteps, candidate);
+  const corroborated = ev.minutes.status === 'enabled' || ev.motion.status === 'enabled' || external.length > 0;
+  if (!corroborated && dayClaim > t.uncorroboratedSteps) {
+    l2 = 0;
+    flag('L2', 'no_corroboration', 'hard', {
+      steps: dayClaim, minutes: ev.minutes.status, motion: ev.motion.status, sources: ev.sources.length,
+    });
+  }
+
+  const layers: Record<LayerName, number | null> = { L0: l0, L1: l1, L2: l2, L3: l3, L4: l4, L5: l5, L6: l6 };
+  const plausibility = weightedScore(layers, config.activity.weights);
+  const hard = flags.filter(f => f.severity === 'hard').map(f => f.kind);
+  const verified = hard.length === 0 && plausibility >= config.activity.verifiedMinScore;
+
+  return {
+    deviceId: input.deviceId,
+    // Never below what the server itself decided the day is worth.
+    displaySteps: Math.max(ev.resolved.steps, deviceSteps, candidate),
+    phone: { counted: deviceSteps, recovered: ev.recoveredSteps, flagged: ev.suspectSteps, clean: phoneClean },
+    phoneClean,
+    sources: ev.sources.map(source => decisions.get(source)!).filter(Boolean),
+    candidate,
+    source: externalWins ? 'health_connect' : 'device',
+    winner,
+    layers,
+    plausibility,
+    flags,
+    hard,
+    verified,
+    verifiedSteps: verified ? candidate : 0,
+  };
+}
+
+/** The weighted mean of the layers that had something to judge (A20). */
+export function weightedScore(layers: Record<LayerName, number | null>, weights: Record<LayerName, number>): number {
+  let total = 0;
+  let weight = 0;
+  for (const [name, score] of Object.entries(layers) as [LayerName, number | null][]) {
+    if (score === null) continue;
+    total += score * weights[name];
+    weight += weights[name];
+  }
+  return weight === 0 ? 0 : Math.round(total / weight);
+}
+
+/**
+ * The user's phones added minute by minute (D-53): in each minute, the most
+ * any one phone counted. Walks taken on different phones add up; a walk
+ * with two phones in the pocket counts once, since both counted the same
+ * minutes.
+ */
+export interface PhoneUnion {
+  /** Every phone's own count, added so. */
+  phones: number;
+  /** The verified phones' clean counts, added so. */
+  verified: number;
+  /** Minutes of the union with at least ⚙ `activity.activeMinuteSteps` timed steps. */
+  activeMinutes: number;
+  /** The union's steps per epoch minute — the day's hours come from these. */
+  minutes: Map<number, number>;
+}
+
+export function unionPhones(inputs: DeviceInput[], scored: DeviceScore[], activeMinuteSteps: number): PhoneUnion {
+  const shown = new Map<number, number>();
+  const clean = new Map<number, number>();
+  const timed = new Map<number, number>();
+  const higher = (map: Map<number, number>, at: number, steps: number) => {
+    if (steps > (map.get(at) ?? 0)) map.set(at, steps);
+  };
+  // Steps a phone's minutes do not hold — counted before minutes were kept,
+  // or by a phone that keeps none — cannot be lined up with another phone's,
+  // so only the largest such remainder is added.
+  let unplaced = 0;
+  let unplacedClean = 0;
+  for (const input of inputs) {
+    const score = scored.find(s => s.deviceId === input.deviceId);
+    const minutes = input.evidence.minuteSteps ?? [];
+    let placed = 0;
+    let placedTimed = 0;
+    for (const [at, timedSteps, untimedSteps] of minutes) {
+      placed += timedSteps + untimedSteps;
+      placedTimed += timedSteps;
+      higher(shown, at, timedSteps + untimedSteps);
+      higher(timed, at, timedSteps);
+    }
+    unplaced = Math.max(unplaced, input.evidence.deviceSteps - placed);
+    if (!score?.verified) continue;
+    // A verified phone's clean count — less what it recovered and flagged —
+    // spread over its timed minutes, so it never adds more than it verified.
+    const scale = placedTimed > score.phoneClean ? score.phoneClean / placedTimed : 1;
+    for (const [at, timedSteps] of minutes) higher(clean, at, timedSteps * scale);
+    unplacedClean = Math.max(unplacedClean, score.phoneClean - placedTimed);
+  }
+  const sum = (map: Map<number, number>) => [...map.values()].reduce((a, b) => a + b, 0);
+  return {
+    phones: Math.round(sum(shown) + Math.max(0, unplaced)),
+    verified: Math.round(sum(clean) + Math.max(0, unplacedClean)),
+    activeMinutes: [...timed.values()].filter(steps => steps >= activeMinuteSteps).length,
+    minutes: shown,
+  };
+}
+
+export interface DayScore {
+  best: DeviceScore;
+  devices: DeviceScore[];
+  /** Every device's flags, once per kind. */
+  flags: DayFlag[];
+  displaySteps: number;
+  /** What the day verified: the phones' union, or the best phone's own answer when that is more. */
+  verifiedSteps: number;
+  union: PhoneUnion;
+}
+
+/**
+ * A user's day across their devices. Their phones are added minute by
+ * minute (D-53) — see [PhoneUnion] — and a phone whose own answer is more
+ * than that, from a watch in its Health Connect, answers instead: a watch's
+ * steps carry no minutes here, so they are never added to another phone's.
+ * With one phone the union is that phone's count, and the day is exactly
+ * what it was. Every device's flags are kept, so a rooted second phone is on
+ * the record whichever phone pays.
+ */
+export function scoreDay(devices: DeviceInput[], history: HistoryDay[], now: Date, config: AppConfig): DayScore {
+  const scored = devices.map(device => scoreDevice(device, history, now, config));
+  const best = scored.reduce((a, b) =>
+    b.verifiedSteps > a.verifiedSteps || (b.verifiedSteps === a.verifiedSteps && b.displaySteps > a.displaySteps) ? b : a,
+  );
+  const seen = new Set<string>();
+  const flags: DayFlag[] = [];
+  for (const device of [best, ...scored.filter(s => s !== best)]) {
+    for (const f of device.flags) {
+      if (seen.has(f.kind)) continue;
+      seen.add(f.kind);
+      flags.push(f);
+    }
+  }
+  const union = unionPhones(devices, scored, config.activity.activeMinuteSteps);
+  return {
+    best,
+    devices: scored,
+    flags,
+    displaySteps: Math.max(union.phones, ...scored.map(s => s.displaySteps)),
+    verifiedSteps: Math.max(union.verified, best.verifiedSteps),
+    union,
+  };
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}

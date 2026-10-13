@@ -1,0 +1,44 @@
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import mongoose from 'mongoose';
+import { afterAll, afterEach, beforeAll } from 'vitest';
+
+process.env.NODE_ENV = 'test';
+process.env.OTP_DEV_ECHO = 'true';
+process.env.JWT_SECRET = 'test-secret-test-secret-test-secret';
+// The operator's door is open in tests, so the admin API can be exercised.
+process.env.ADMIN_API_KEY = 'test-admin-key-test-admin-key';
+delete process.env.REDIS_URL;
+// No reaching out to Google from a test: the revocation list is stubbed where it matters.
+process.env.ATTESTATION_STATUS_URL = '';
+delete process.env.PLAY_INTEGRITY_SERVICE_ACCOUNT;
+delete process.env.PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER;
+
+let replSet: MongoMemoryReplSet;
+
+beforeAll(async () => {
+  // Transactions need a replica set — a single-node one is enough.
+  replSet = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger' } });
+  process.env.MONGODB_URI = replSet.getUri('vokve_test');
+  const { connectMongo } = await import('../src/db/mongo.js');
+  await connectMongo(process.env.MONGODB_URI);
+  await mongoose.connection.db!.admin().command({ ping: 1 });
+  // Ensure indexes exist before tests rely on unique constraints.
+  await Promise.all(Object.values(mongoose.models).map(m => m.syncIndexes()));
+});
+
+afterEach(async () => {
+  const collections = await mongoose.connection.db!.collections();
+  await Promise.all(collections.map(c => c.deleteMany({})));
+  const { invalidateConfig } = await import('../src/config/remote.js');
+  invalidateConfig();
+  // The in-memory KV holds rate-limit counters, idempotency replays and
+  // burned step-up tokens; each test starts with none of another's. In
+  // tests `quit()` only empties the map — the instance stays usable.
+  const { getKV } = await import('../src/db/redis.js');
+  await getKV().quit();
+});
+
+afterAll(async () => {
+  await mongoose.disconnect();
+  await replSet?.stop();
+});
